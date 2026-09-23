@@ -1,4 +1,7 @@
-import { envsafe, str, bool } from "envsafe";
+import { envsafe, str, bool, makeValidator } from "envsafe";
+import { parseRetentionCount } from "./retention.js";
+
+const retentionCount = makeValidator<number>((input) => parseRetentionCount(String(input)));
 
 export const env = envsafe({
   AWS_ACCESS_KEY_ID: str(),
@@ -12,6 +15,14 @@ export const env = envsafe({
     desc: 'The cron schedule to run the backup on.',
     default: '0 5 * * *',
     allowEmpty: true
+  }),
+  BACKUP_RETENTION_COUNT: retentionCount({
+    desc: 'Number of successfully uploaded backups to keep; zero disables retention.',
+    default: 0,
+  }),
+  BACKUP_RETENTION_DRY_RUN: bool({
+    desc: 'Report expired backups without deleting them.',
+    default: true,
   }),
   AWS_S3_ENDPOINT: str({
     desc: 'The S3 custom endpoint you want to use.',

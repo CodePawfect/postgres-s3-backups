@@ -1,13 +1,21 @@
-import { exec, execSync } from "child_process";
+import { execFile, spawn } from "child_process";
 import { S3Client, S3ClientConfig, PutObjectCommandInput } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
-import { createReadStream, unlink, statSync } from "fs";
+import { createReadStream, createWriteStream, statSync } from "fs";
+import { rm } from "fs/promises";
 import { filesize } from "filesize";
 import path from "path";
 import os from "os";
+import { promisify } from "util";
+import { once } from "events";
+import { pipeline } from "stream/promises";
+import { createGzip } from "zlib";
 
 import { env } from "./env.js";
 import { createMD5 } from "./util.js";
+import { pruneBackups } from "./retention.js";
+
+const runCommand = promisify(execFile);
 
 const uploadToS3 = async ({ name, path }: { name: string, path: string }) => {
   console.log("Uploading backup to S3...");
@@ -47,60 +55,57 @@ const uploadToS3 = async ({ name, path }: { name: string, path: string }) => {
 
   const client = new S3Client(clientOptions);
 
-  await new Upload({
-    client,
-    params: params
-  }).done();
-
-  console.log("Backup uploaded to S3...");
+  try {
+    await new Upload({ client, params }).done();
+    console.log("Backup uploaded to S3...");
+    await pruneBackups(client, {
+      bucket,
+      filePrefix: env.BACKUP_FILE_PREFIX,
+      subfolder: env.BUCKET_SUBFOLDER,
+      count: env.BACKUP_RETENTION_COUNT,
+      uploadedKey: name,
+      dryRun: env.BACKUP_RETENTION_DRY_RUN,
+    });
+  } finally {
+    client.destroy();
+  }
 }
 
 const dumpToFile = async (filePath: string) => {
   console.log("Dumping DB to file...");
 
-  await new Promise((resolve, reject) => {
-    exec(`pg_dump --dbname=${env.BACKUP_DATABASE_URL} --format=tar ${env.BACKUP_OPTIONS} | gzip > ${filePath}`, (error, stdout, stderr) => {
-      if (error) {
-        reject({ error: error, stderr: stderr.trimEnd() });
-        return;
-      }
-
-      // check if archive is valid and contains data
-      const isValidArchive = (execSync(`gzip -cd ${filePath} | head -c1`).length == 1) ? true : false;
-      if (isValidArchive == false) {
-        reject({ error: "Backup archive file is invalid or empty; check for errors above" });
-        return;
-      }
-
-      // not all text in stderr will be a critical error, print the error / warning
-      if (stderr != "") {
-        console.log({ stderr: stderr.trimEnd() });
-      }
-
-      console.log("Backup archive file is valid");
-      console.log("Backup filesize:", filesize(statSync(filePath).size));
-
-      // if stderr contains text, let the user know that it was potently just a warning message
-      if (stderr != "") {
-        console.log(`Potential warnings detected; Please ensure the backup file "${path.basename(filePath)}" contains all needed data`);
-      }
-
-      resolve(undefined);
+  // Keep the database URL out of command text and error logs. Check pg_dump's
+  // exit status separately from compression so partial output cannot trigger retention.
+  const options = { env: { ...process.env, PGDATABASE: env.BACKUP_DATABASE_URL, BACKUP_OUTPUT: filePath } };
+  try {
+    const dump = spawn("sh", ["-c", `exec pg_dump --dbname="$PGDATABASE" --format=tar ${env.BACKUP_OPTIONS}`], {
+      ...options, stdio: ["ignore", "pipe", "pipe"],
     });
-  });
+    let warnings = false;
+    dump.stderr.on("data", () => { warnings = true; });
+    const exited = once(dump, "close").then(([code]) => {
+      if (code !== 0) throw new Error("pg_dump failed");
+    });
+    const compressed = pipeline(dump.stdout, createGzip(), createWriteStream(filePath));
+    try {
+      await Promise.all([exited, compressed]);
+    } catch {
+      dump.kill();
+      await Promise.allSettled([exited, compressed]);
+      throw new Error("Dump or compression failed");
+    }
+    if (warnings) console.warn("pg_dump reported warnings; verify backup contents before relying on this restore point");
+    await runCommand("gzip", ["-t", filePath]);
+    // pg_restore --list may stop reading after the table of contents. gzip -t
+    // above checks the full compressed file independently of that early exit.
+    await runCommand("sh", ["-c", 'gzip -cd "$BACKUP_OUTPUT" | pg_restore --list > /dev/null'], options);
+  } catch {
+    throw new Error("Database dump or archive validation failed; no backup was uploaded or pruned");
+  }
 
+  console.log("Backup archive file is valid");
+  console.log("Backup filesize:", filesize(statSync(filePath).size));
   console.log("DB dumped to file...");
-}
-
-const deleteFile = async (path: string) => {
-  console.log("Deleting file...");
-  await new Promise((resolve, reject) => {
-    unlink(path, (err) => {
-      reject({ error: err });
-      return;
-    });
-    resolve(undefined);
-  });
 }
 
 export const backup = async () => {
@@ -111,9 +116,12 @@ export const backup = async () => {
   const filename = `${env.BACKUP_FILE_PREFIX}-${timestamp}.tar.gz`;
   const filepath = path.join(os.tmpdir(), filename);
 
-  await dumpToFile(filepath);
-  await uploadToS3({ name: filename, path: filepath });
-  await deleteFile(filepath);
+  try {
+    await dumpToFile(filepath);
+    await uploadToS3({ name: filename, path: filepath });
+  } finally {
+    await rm(filepath, { force: true });
+  }
 
   console.log("DB backup complete...");
 }

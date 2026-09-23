@@ -16,7 +16,11 @@ A simple NodeJS application to backup your PostgreSQL database to S3 via a cron.
 
 - `BACKUP_DATABASE_URL` - The connection string of the database to backup.
 
-- `BACKUP_CRON_SCHEDULE` - The cron schedule to run the backup on. Example: `0 5 * * *`
+- `BACKUP_CRON_SCHEDULE` - The cron schedule in UTC. Example: `0 2 * * *` runs once daily at 02:00 UTC.
+
+- `BACKUP_RETENTION_COUNT` - Keep this many successfully uploaded backups for the configured file prefix and subfolder. Default `0` disables cleanup. Requires an S3 provider supporting `ListObjectVersions` and version-specific deletion (including Backblaze B2).
+
+- `BACKUP_RETENTION_DRY_RUN` - Report what retention would remove without deleting anything. Default `true`. Set to `false` only after reviewing the bucket contents and count.
 
 - `AWS_S3_ENDPOINT` - The S3 custom endpoint you want to use. Applicable for 3-rd party S3 services such as Cloudflare R2 or Backblaze R2.
 
@@ -41,3 +45,35 @@ A simple NodeJS application to backup your PostgreSQL database to S3 via a cron.
 ## Notes for Postgres 17
 
 If backing up a Postgres 17 database imported from Postgres 16, set `PG_VERSION=17` and `NODE_VERSION=22`.
+
+## Daily backups with count-based retention
+
+For 20 restore points, use `BACKUP_CRON_SCHEDULE=0 2 * * *` and `BACKUP_RETENTION_COUNT=20`.
+Review the dry-run summary, then set `BACKUP_RETENTION_DRY_RUN=false` to enable deletion.
+Only timestamped `.tar.gz` files matching this service's exact prefix and subfolder are managed.
+Use a separate prefix or subfolder for each database and run only one writer for that scope.
+Manual/startup backups also count toward the limit; 20 backups are not necessarily 20 calendar days.
+
+Cleanup runs only after `pg_dump` succeeds, the gzip and PostgreSQL archive checks pass, and
+the upload completes. These structural checks do not replace periodic restore tests.
+The full paginated version listing must contain the newly uploaded backup in the retained
+set before any deletion starts. Listing failures, missing version metadata, invalid settings,
+and upload failures never trigger deletion. All versions of expired backup keys are deleted
+by version ID, so Backblaze frees their storage instead of only adding delete markers.
+Unrelated files, already hidden keys, and all versions of retained keys are left untouched.
+Partial deletion failures are reported as failed runs; the retained set is never targeted.
+
+The service key needs permission to list object versions and delete object versions in the
+backup scope in addition to uploading backups. Buckets with object retention/holds may reject
+deletion; this service does not bypass them. Providers without version-listing support can
+continue running with retention disabled.
+
+If the bucket is already at its storage cap, the first new upload cannot succeed. Review a
+one-off cleanup manifest and free space before restarting. When moving from hourly to daily
+backups, keep one successful backup per day for the last 20 available days during this initial
+cleanup; simply keeping the last 20 hourly files would preserve less than one day of history.
+Backblaze's "keep prior versions" lifecycle option alone cannot expire timestamped files,
+because every backup has a new key. See [Backblaze lifecycle rules](https://www.backblaze.com/docs/cloud-storage-lifecycle-rules).
+
+Run `npm run typecheck` and `npm test` before deployment. Test deletion paths use a mock S3
+client or a local server and never access a real bucket.

@@ -26,7 +26,7 @@ if (env.RUN_ON_STARTUP || env.SINGLE_SHOT_MODE) {
 
 const job = new CronJob(env.BACKUP_CRON_SCHEDULE, async () => {
   await tryBackup();
-});
+}, null, false, "UTC");
 
 job.start();
 
